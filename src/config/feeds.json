@@ -1724,12 +1724,7 @@
       "category": 1,
       "name": "USDX/USD"
     },
-    "sources": [
-      {
-        "exchange": "bitmart",
-        "symbol": "USDX/USDT"
-      }
-    ]
+    "sources": []
   },
   {
     "feed": {

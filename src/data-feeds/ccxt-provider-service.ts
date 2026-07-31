@@ -5,6 +5,7 @@ import { BaseDataFeed } from './base-feed';
 import { retry, RetryError, sleepFor } from 'src/utils/retry';
 import { VolumeStore } from './volumes';
 import { asError } from '../utils/error';
+import { USDX_FEED_NAME, UsdxFallback } from '../utils/usdx-fallback';
 
 import prodFeeds from '../config/feeds.json';
 import testFeeds from '../config/test-feeds.json';
@@ -54,6 +55,9 @@ export class CcxtFeed implements BaseDataFeed {
   private configByKey = new Map<string, FeedConfig>();
 
   private readonly exchangeByName: Map<string, Exchange> = new Map();
+
+  /** TEMPORARY, see utils/usdx-fallback.ts */
+  private readonly usdxFallback = new UsdxFallback();
 
   /** Symbol -> exchange -> last price */
   private readonly latestPrice: Map<string, Map<string, PriceInfo>> = new Map();
@@ -112,6 +116,7 @@ export class CcxtFeed implements BaseDataFeed {
     }
 
     this.initWatchTrades(exchangeToSymbols);
+    this.usdxFallback.start(); // TEMPORARY, see utils/usdx-fallback.ts
 
     this.initialized = true;
     this.logger.log(`Initialization done, watching trades...`);
@@ -348,6 +353,12 @@ export class CcxtFeed implements BaseDataFeed {
     }
 
     if (prices.length === 0) {
+      // TEMPORARY, see utils/usdx-fallback.ts
+      if (feedId.name === USDX_FEED_NAME) {
+        const fallback = this.usdxFallback.getPrice();
+        if (fallback !== undefined) return fallback;
+      }
+
       this.logger.warn(`No prices found for ${JSON.stringify(feedId)}`);
       // Attempt to fetch last known price from exchanges. Don't block on this request - data will be available later on re-query.
       void this.fetchLastPrices(config);
