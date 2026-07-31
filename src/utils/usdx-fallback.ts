@@ -1,6 +1,5 @@
 import { Logger } from '@nestjs/common';
 import { sleepFor } from './retry';
-import { asError } from './error';
 
 /**
  * TEMPORARY stopgap price source for USDX/USD.
@@ -38,9 +37,26 @@ const REQUEST_TIMEOUT_MS = 15_000;
 const MIN_VALUE = 0.9;
 const MAX_VALUE = 1.1;
 
+/**
+ * Deliberately not `asError`, which itself throws when handed a non-Error value.
+ * Called from catch blocks, where throwing would break out of the polling loop.
+ */
+function messageOf(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  try {
+    return JSON.stringify(e) ?? 'unknown error';
+  } catch {
+    return 'unknown error';
+  }
+}
+
 export class UsdxFallback {
   private readonly logger = new Logger(UsdxFallback.name);
   private price: { value: number; time: number } | undefined;
+  /** Whether the last poll failed, so an outage warns once rather than every cycle. */
+  private failing = false;
+  /** Whether the stale-price warning has already been emitted for the current price. */
+  private staleWarned = false;
 
   /** Starts background polling. Returns immediately; never throws. */
   start() {
@@ -50,10 +66,21 @@ export class UsdxFallback {
         return;
       }
       this.logger.log(`Starting ${USDX_FEED_NAME} DEX fallback, polling every ${POLL_INTERVAL_MS}ms`);
-      void this.poll();
+      this.runPollLoop();
     } catch (e) {
-      this.logger.warn(`Failed to start ${USDX_FEED_NAME} fallback, continuing without it: ${asError(e).message}`);
+      this.logger.warn(`Failed to start ${USDX_FEED_NAME} fallback, continuing without it: ${messageOf(e)}`);
     }
+  }
+
+  /**
+   * Last-resort net: `poll` is written so it can never reject, but if it somehow
+   * does, restart it rather than silently stopping forever.
+   */
+  private runPollLoop() {
+    void this.poll().catch((e: unknown) => {
+      this.logger.error(`${USDX_FEED_NAME} poll loop exited unexpectedly, restarting: ${messageOf(e)}`);
+      setTimeout(() => this.runPollLoop(), POLL_INTERVAL_MS).unref();
+    });
   }
 
   /** Last known price, or undefined if never fetched or stale. Never throws. */
@@ -62,7 +89,11 @@ export class UsdxFallback {
 
     const age = Date.now() - this.price.time;
     if (age > MAX_AGE_MS) {
-      this.logger.warn(`${USDX_FEED_NAME} fallback price is stale (${Math.round(age / 1000)}s old), ignoring`);
+      // Warn once when it goes stale, not on every query.
+      if (!this.staleWarned) {
+        this.logger.warn(`${USDX_FEED_NAME} fallback price is stale (${Math.round(age / 1000)}s old), ignoring`);
+        this.staleWarned = true;
+      }
       return undefined;
     }
     return this.price.value;
@@ -73,11 +104,29 @@ export class UsdxFallback {
       try {
         const value = await this.fetchPrice();
         if (value !== undefined) {
-          this.logger.log(`${USDX_FEED_NAME} DEX fallback price: ${value}`);
+          // Only announce state changes; a healthy poll every few minutes is not
+          // worth a log line, so it goes to debug (off unless LOG_LEVEL=debug).
+          if (this.price === undefined) {
+            this.logger.log(`${USDX_FEED_NAME} DEX fallback price: ${value}`);
+          } else if (this.failing) {
+            this.logger.log(`${USDX_FEED_NAME} DEX fallback recovered, price: ${value}`);
+          } else {
+            this.logger.debug(`${USDX_FEED_NAME} DEX fallback price: ${value}`);
+          }
+          this.failing = false;
+          this.staleWarned = false;
           this.price = { value, time: Date.now() };
         }
       } catch (e) {
-        this.logger.warn(`Failed to fetch ${USDX_FEED_NAME} fallback price: ${asError(e).message}`);
+        // Keep polling: a failed fetch just means the previous price stands until
+        // it ages out, and the next cycle may well succeed. Warn once per outage,
+        // then stay quiet until something changes.
+        if (this.failing) {
+          this.logger.debug(`${USDX_FEED_NAME} fallback still failing: ${messageOf(e)}`);
+        } else {
+          this.logger.warn(`${USDX_FEED_NAME} fallback poll failed, will keep retrying: ${messageOf(e)}`);
+        }
+        this.failing = true;
       }
       await sleepFor(POLL_INTERVAL_MS);
     }
@@ -94,15 +143,13 @@ export class UsdxFallback {
     const prices = body?.data?.attributes?.token_prices ?? {};
     const value = parseFloat(prices[TOKEN_ADDRESS.toLowerCase()]);
 
+    // Thrown rather than logged here so a persistently misbehaving upstream goes
+    // through the same warn-once-per-outage handling as a failed request.
     if (!isFinite(value) || value <= 0) {
-      this.logger.warn(`Ignoring invalid ${USDX_FEED_NAME} fallback price: ${value}`);
-      return undefined;
+      throw new Error(`invalid price: ${value}`);
     }
     if (value < MIN_VALUE || value > MAX_VALUE) {
-      this.logger.warn(
-        `Ignoring out-of-band ${USDX_FEED_NAME} fallback price ${value} (expected [${MIN_VALUE}, ${MAX_VALUE}])`,
-      );
-      return undefined;
+      throw new Error(`price ${value} outside sanity band [${MIN_VALUE}, ${MAX_VALUE}]`);
     }
     return value;
   }
