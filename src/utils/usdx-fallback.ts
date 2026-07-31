@@ -104,11 +104,10 @@ export class UsdxFallback {
       try {
         const value = await this.fetchPrice();
         if (value !== undefined) {
-          // Only announce state changes; a healthy poll every few minutes is not
-          // worth a log line, so it goes to debug (off unless LOG_LEVEL=debug).
-          if (this.price === undefined) {
-            this.logger.log(`${USDX_FEED_NAME} DEX fallback price: ${value}`);
-          } else if (this.failing) {
+          // A working poll is not news: prices go to debug (off unless
+          // LOG_LEVEL=debug). Only recovery is announced, and only because it
+          // closes off a warning that was already emitted.
+          if (this.failing) {
             this.logger.log(`${USDX_FEED_NAME} DEX fallback recovered, price: ${value}`);
           } else {
             this.logger.debug(`${USDX_FEED_NAME} DEX fallback price: ${value}`);
