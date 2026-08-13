@@ -8,12 +8,12 @@ import helmet from 'helmet';
 import { LogLevel } from '@nestjs/common';
 
 async function bootstrap() {
-  let logLevels: LogLevel[] = ['log'];
-  if (process.env.LOG_LEVEL == 'debug') {
-    logLevels = ['verbose'];
-  }
-  if (process.env.LOG_LEVEL == 'warn') {
-    logLevels = ['warn'];
+  let logLevels: LogLevel[] = ['log', 'warn', 'error'];
+
+  if (process.env.LOG_LEVEL === 'debug') {
+    logLevels = ['log', 'debug', 'verbose', 'warn', 'error'];
+  } else if (process.env.LOG_LEVEL === 'warn') {
+    logLevels = ['warn', 'error'];
   }
 
   const app = await NestFactory.create(AppModule, { logger: logLevels });
