@@ -19,6 +19,10 @@ import { FixedFeed } from './data-feeds/fixed-feed';
           dataFeed = new FixedFeed();
         } else if (process.env.VALUE_PROVIDER_IMPL == 'random') {
           dataFeed = new RandomFeed();
+        } else if (process.env.VALUE_PROVIDER_IMPL == 'ftso-v1') {
+          const ftsoFeed = new FtsoFeedV1();
+          await ftsoFeed.start();
+          dataFeed = ftsoFeed;
         } else {
           const ccxtFeed = new CcxtFeed();
           await ccxtFeed.start();
