@@ -95,7 +95,7 @@ export class FtsoFeedV1 implements BaseDataFeed {
         throw new Error(`Invalid price at JSON path "${config.pricePath}"`);
       }
 
-      this.logger.debug(`Using API price for ${feed.name}: ${price}`);
+      this.logger.log(`Using API price for ${feed.name}: ${price}`);
       return price;
     } finally {
       clearTimeout(timeout);
