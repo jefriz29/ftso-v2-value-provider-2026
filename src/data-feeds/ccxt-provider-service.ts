@@ -38,6 +38,7 @@ interface LoadResult {
 }
 
 const RETRY_BACKOFF_MS = 10_000;
+const CONFIGURED_CCXT_EXCHANGES = parseExchangeFilter(process.env.CCXT_EXCHANGES);
 
 // Parameter for exponential decay in time-weighted median price calculation
 const LAMBDA = process.env.MEDIAN_DECAY ? parseFloat(process.env.MEDIAN_DECAY) : 0.00005;
@@ -70,6 +71,7 @@ export class CcxtFeed implements BaseDataFeed {
 
     for (const feed of this.config) {
       for (const source of feed.sources) {
+        if (CONFIGURED_CCXT_EXCHANGES !== undefined && !CONFIGURED_CCXT_EXCHANGES.has(source.exchange)) continue;
         const symbols = exchangeToSymbols.get(source.exchange) || new Set();
         symbols.add(source.symbol);
         exchangeToSymbols.set(source.exchange, symbols);
@@ -490,4 +492,14 @@ export class CcxtFeed implements BaseDataFeed {
 
 function feedsEqual(a: FeedId, b: FeedId): boolean {
   return a.category === b.category && a.name === b.name;
+}
+
+function parseExchangeFilter(raw: string | undefined): Set<string> | undefined {
+  if (raw === undefined || raw.trim() === '') return undefined;
+  return new Set(
+    raw
+      .split(',')
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean),
+  );
 }
