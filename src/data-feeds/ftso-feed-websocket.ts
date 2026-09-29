@@ -8,11 +8,15 @@ import { WebSocketPriceService } from './websocket-price-service';
 export class FtsoFeedWebSocket implements BaseDataFeed {
   private readonly logger = new Logger(FtsoFeedWebSocket.name);
   private readonly websocket = new WebSocketPriceService();
-  private readonly fallback = new FtsoFeedV1();
+
+  constructor(
+    private readonly fallback: FtsoFeedV1 = new FtsoFeedV1(),
+    private readonly startFallback = true,
+  ) {}
 
   async start(): Promise<void> {
     this.websocket.start();
-    await this.fallback.start();
+    if (this.startFallback) await this.fallback.start();
     this.logger.log('WebSocket-primary provider initialized; API/CCXT fallback enabled');
   }
 
