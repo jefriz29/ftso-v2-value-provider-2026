@@ -13,6 +13,8 @@ export interface CombinedPriceResult {
   source: FinalPriceSource;
   v1DeviationPct?: number;
   websocketDeviationPct?: number;
+  selectedDeviationPct?: number;
+  nearCcxt?: boolean;
 }
 
 export interface CachedPrice {
@@ -53,6 +55,7 @@ export function selectCombinedPrice(
   v1Price: number | undefined,
   websocketPrice: number | undefined,
   ccxtPrice: number | undefined,
+  nearCcxtMaxDeviationPct = 0.2,
 ): CombinedPriceResult {
   const v1 = validPrice(v1Price);
   const websocket = validPrice(websocketPrice);
@@ -62,13 +65,56 @@ export function selectCombinedPrice(
     const v1DeviationPct = v1 === undefined ? undefined : percentageDeviation(v1, ccxt);
     const websocketDeviationPct = websocket === undefined ? undefined : percentageDeviation(websocket, ccxt);
 
-    if (v1 === undefined) return { value: websocket, source: 'ftso-websocket', websocketDeviationPct };
-    if (websocket === undefined) return { value: v1, source: 'ftso-v1', v1DeviationPct };
+    if (v1 === undefined) {
+      return {
+        value: websocket,
+        source: 'ftso-websocket',
+        websocketDeviationPct,
+        selectedDeviationPct: websocketDeviationPct,
+        nearCcxt: websocketDeviationPct <= nearCcxtMaxDeviationPct,
+      };
+    }
+    if (websocket === undefined) {
+      return {
+        value: v1,
+        source: 'ftso-v1',
+        v1DeviationPct,
+        selectedDeviationPct: v1DeviationPct,
+        nearCcxt: v1DeviationPct <= nearCcxtMaxDeviationPct,
+      };
+    }
+
+    // Prefer the direct WebSocket value when it is already near CCXT. It is
+    // usually the freshest and retains more precision than rounded API data.
+    if (websocketDeviationPct <= nearCcxtMaxDeviationPct) {
+      return {
+        value: websocket,
+        source: 'ftso-websocket',
+        v1DeviationPct,
+        websocketDeviationPct,
+        selectedDeviationPct: websocketDeviationPct,
+        nearCcxt: true,
+      };
+    }
 
     if (websocketDeviationPct < v1DeviationPct) {
-      return { value: websocket, source: 'ftso-websocket', v1DeviationPct, websocketDeviationPct };
+      return {
+        value: websocket,
+        source: 'ftso-websocket',
+        v1DeviationPct,
+        websocketDeviationPct,
+        selectedDeviationPct: websocketDeviationPct,
+        nearCcxt: false,
+      };
     }
-    return { value: v1, source: 'ftso-v1', v1DeviationPct, websocketDeviationPct };
+    return {
+      value: v1,
+      source: 'ftso-v1',
+      v1DeviationPct,
+      websocketDeviationPct,
+      selectedDeviationPct: v1DeviationPct,
+      nearCcxt: v1DeviationPct <= nearCcxtMaxDeviationPct,
+    };
   }
 
   if (v1 !== undefined && websocket !== undefined) {
@@ -87,10 +133,11 @@ export function selectCombinedPrice(
 export class FtsoFeedCombined implements BaseDataFeed {
   private readonly logger = new Logger(FtsoFeedCombined.name);
   private readonly ccxt = new CcxtFeed();
-  private readonly v1 = new FtsoFeedV1(this.ccxt, false);
+  private readonly v1 = new FtsoFeedV1(this.ccxt, false, false);
   private readonly websocket = new WebSocketPriceService();
   private readonly lastGoodPrices = new Map<string, CachedPrice>();
   private readonly lastGoodPriceMaxAgeMs = positiveIntegerFromEnv('LAST_GOOD_PRICE_MAX_AGE_MS', 30_000);
+  private readonly nearCcxtMaxDeviationPct = positiveNumberFromEnv('NEAR_CCXT_MAX_DEVIATION_PCT', 0.2);
 
   async start(): Promise<void> {
     await this.ccxt.start();
@@ -122,14 +169,16 @@ export class FtsoFeedCombined implements BaseDataFeed {
       const v1Price = v1ByKey.get(key);
       const websocketPrice = websocketByKey.get(key);
       const ccxtPrice = ccxtByKey.get(key);
-      const liveSelection = selectCombinedPrice(v1Price, websocketPrice, ccxtPrice);
+      const liveSelection = selectCombinedPrice(v1Price, websocketPrice, ccxtPrice, this.nearCcxtMaxDeviationPct);
       const selected = this.useLastGoodPrice(key, liveSelection);
 
       this.logger.log(
         `Combined price for ${feed.name}: selected=${selected.value ?? 'unavailable'} source=${selected.source} ` +
           `v1=${v1Price ?? 'unavailable'} websocket=${websocketPrice ?? 'unavailable'} ccxt=${ccxtPrice ?? 'unavailable'} ` +
           `v1DeviationPct=${formatDeviation(selected.v1DeviationPct)} ` +
-          `websocketDeviationPct=${formatDeviation(selected.websocketDeviationPct)}`,
+          `websocketDeviationPct=${formatDeviation(selected.websocketDeviationPct)} ` +
+          `selectedDeviationPct=${formatDeviation(selected.selectedDeviationPct)} ` +
+          `nearCcxt=${selected.nearCcxt ?? 'n/a'} nearLimitPct=${this.nearCcxtMaxDeviationPct.toFixed(6)}`,
       );
 
       return { feed, value: selected.value };
@@ -190,4 +239,9 @@ function formatDeviation(value: number | undefined): string {
 function positiveIntegerFromEnv(name: string, fallback: number): number {
   const value = Number(process.env[name]);
   return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function positiveNumberFromEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
 }
