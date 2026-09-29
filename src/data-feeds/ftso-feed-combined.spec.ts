@@ -1,4 +1,4 @@
-import { selectCombinedPrice } from './ftso-feed-combined';
+import { CachedPrice, resolveWithLastGoodPrice, selectCombinedPrice } from './ftso-feed-combined';
 
 describe('selectCombinedPrice', () => {
   it('selects the V1 price when it is nearer to CCXT', () => {
@@ -43,5 +43,32 @@ describe('selectCombinedPrice', () => {
 
   it('returns unavailable when no source has a valid positive price', () => {
     expect(selectCombinedPrice(0, Number.NaN, undefined)).toEqual({ value: undefined, source: 'unavailable' });
+  });
+});
+
+describe('resolveWithLastGoodPrice', () => {
+  it('uses a recent last-good value when every live source is unavailable', () => {
+    const cache = new Map<string, CachedPrice>();
+    resolveWithLastGoodPrice(cache, '1:HYPE/USD', { value: 88.25, source: 'ftso-v1' }, 30_000, 1_000);
+
+    expect(
+      resolveWithLastGoodPrice(cache, '1:HYPE/USD', { value: undefined, source: 'unavailable' }, 30_000, 20_000),
+    ).toEqual({ result: { value: 88.25, source: 'last-good' }, cacheAgeMs: 19_000 });
+  });
+
+  it('does not use a last-good value after it expires', () => {
+    const cache = new Map<string, CachedPrice>();
+    resolveWithLastGoodPrice(cache, '1:LEO/USD', { value: 9.5, source: 'ccxt' }, 30_000, 1_000);
+
+    expect(
+      resolveWithLastGoodPrice(cache, '1:LEO/USD', { value: undefined, source: 'unavailable' }, 30_000, 31_001),
+    ).toEqual({ result: { value: undefined, source: 'unavailable' } });
+    expect(cache.size).toBe(0);
+  });
+
+  it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])('never caches an invalid price: %s', (value) => {
+    const cache = new Map<string, CachedPrice>();
+    resolveWithLastGoodPrice(cache, '1:HYPE/USD', { value, source: 'unavailable' }, 30_000, 1_000);
+    expect(cache.size).toBe(0);
   });
 });
