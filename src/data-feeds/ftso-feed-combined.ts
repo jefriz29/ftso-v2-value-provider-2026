@@ -6,12 +6,43 @@ import { FtsoFeedV1 } from './ftso-feed-v1';
 import { WebSocketPriceService } from './websocket-price-service';
 
 type PriceSource = 'ftso-v1' | 'ftso-websocket' | 'ccxt';
+type FinalPriceSource = PriceSource | 'median' | 'last-good' | 'unavailable';
 
 export interface CombinedPriceResult {
   value: number | undefined;
-  source: PriceSource | 'median' | 'unavailable';
+  source: FinalPriceSource;
   v1DeviationPct?: number;
   websocketDeviationPct?: number;
+}
+
+export interface CachedPrice {
+  value: number;
+  savedAtMs: number;
+}
+
+export function resolveWithLastGoodPrice(
+  cache: Map<string, CachedPrice>,
+  key: string,
+  selected: CombinedPriceResult,
+  maxAgeMs: number,
+  nowMs = Date.now(),
+): { result: CombinedPriceResult; cacheAgeMs?: number } {
+  const freshValue = validPrice(selected.value);
+  if (freshValue !== undefined) {
+    cache.set(key, { value: freshValue, savedAtMs: nowMs });
+    return { result: selected };
+  }
+
+  const cached = cache.get(key);
+  if (cached === undefined) return { result: selected };
+
+  const cacheAgeMs = nowMs - cached.savedAtMs;
+  if (cacheAgeMs > maxAgeMs) {
+    cache.delete(key);
+    return { result: selected };
+  }
+
+  return { result: { value: cached.value, source: 'last-good' }, cacheAgeMs };
 }
 
 /**
@@ -58,6 +89,8 @@ export class FtsoFeedCombined implements BaseDataFeed {
   private readonly ccxt = new CcxtFeed();
   private readonly v1 = new FtsoFeedV1(this.ccxt, false);
   private readonly websocket = new WebSocketPriceService();
+  private readonly lastGoodPrices = new Map<string, CachedPrice>();
+  private readonly lastGoodPriceMaxAgeMs = positiveIntegerFromEnv('LAST_GOOD_PRICE_MAX_AGE_MS', 30_000);
 
   async start(): Promise<void> {
     await this.ccxt.start();
@@ -89,7 +122,8 @@ export class FtsoFeedCombined implements BaseDataFeed {
       const v1Price = v1ByKey.get(key);
       const websocketPrice = websocketByKey.get(key);
       const ccxtPrice = ccxtByKey.get(key);
-      const selected = selectCombinedPrice(v1Price, websocketPrice, ccxtPrice);
+      const liveSelection = selectCombinedPrice(v1Price, websocketPrice, ccxtPrice);
+      const selected = this.useLastGoodPrice(key, liveSelection);
 
       this.logger.log(
         `Combined price for ${feed.name}: selected=${selected.value ?? 'unavailable'} source=${selected.source} ` +
@@ -118,6 +152,14 @@ export class FtsoFeedCombined implements BaseDataFeed {
       return { feed, value: direct.value };
     });
   }
+
+  private useLastGoodPrice(key: string, selected: CombinedPriceResult): CombinedPriceResult {
+    const resolved = resolveWithLastGoodPrice(this.lastGoodPrices, key, selected, this.lastGoodPriceMaxAgeMs);
+    if (resolved.result.source === 'last-good') {
+      this.logger.warn(`All live prices unavailable for ${key}; using last-good price ageMs=${resolved.cacheAgeMs}`);
+    }
+    return resolved.result;
+  }
 }
 
 function validPrice(value: number | undefined): number | undefined {
@@ -143,4 +185,9 @@ function feedKey(feed: FeedId): string {
 
 function formatDeviation(value: number | undefined): string {
   return value === undefined ? 'n/a' : value.toFixed(6);
+}
+
+function positiveIntegerFromEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) && value > 0 ? value : fallback;
 }
