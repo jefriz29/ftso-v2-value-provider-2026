@@ -180,39 +180,41 @@ export class CcxtFeed implements BaseDataFeed {
       const exchange = this.exchangeByName.get(exchangeName);
       if (exchange === undefined) continue;
 
-      const marketIds: string[] = [];
+      const marketSymbols: string[] = [];
       for (const symbol of symbols) {
         const market = exchange.markets[symbol];
         if (market === undefined) {
           this.logger.warn(`Market not found for ${symbol} on ${exchangeName}`);
           continue;
         }
-        marketIds.push(market.id);
+        // CCXT public methods expect unified symbols (for example HYPE/USDT),
+        // not exchange-native market IDs (for example HYPEUSDT).
+        marketSymbols.push(market.symbol);
       }
 
-      void this.watch(exchange, marketIds, exchangeName);
+      void this.watch(exchange, marketSymbols, exchangeName);
     }
   }
 
-  private watch(exchange: Exchange, marketIds: string[], exchangeName: string) {
-    this.logger.log(`Watching trades for ${marketIds} on exchange ${exchangeName}`);
+  private watch(exchange: Exchange, marketSymbols: string[], exchangeName: string) {
+    this.logger.log(`Watching trades for ${marketSymbols} on exchange ${exchangeName}`);
     if (exchange.has['watchTradesForSymbols'] && exchange.id != 'bybit') {
-      void this.watchTradesForSymbols(exchange, marketIds);
+      void this.watchTradesForSymbols(exchange, marketSymbols);
     } else if (exchange.has['watchTrades']) {
-      marketIds.forEach((marketId) => void this.watchTradesForSymbol(exchange, marketId));
+      marketSymbols.forEach((symbol) => void this.watchTradesForSymbol(exchange, symbol));
     } else {
       this.logger.warn(`Exchange ${exchange.id} does not support watching trades, polling for trades instead`);
-      void this.fetchTrades(exchange, marketIds, exchangeName);
+      void this.fetchTrades(exchange, marketSymbols, exchangeName);
     }
   }
 
-  private async fetchTrades(exchange: Exchange, marketIds: string[], exchangeName: string) {
+  private async fetchTrades(exchange: Exchange, marketSymbols: string[], exchangeName: string) {
     while (true) {
       try {
         await retry(
           async () => {
-            for (const marketId of marketIds) {
-              const trades = await exchange.fetchTrades(marketId);
+            for (const symbol of marketSymbols) {
+              const trades = await exchange.fetchTrades(symbol);
               if (trades.length > 0) {
                 trades.sort((a, b) => b.timestamp - a.timestamp);
                 const latestTrade = trades[0];
@@ -220,7 +222,7 @@ export class CcxtFeed implements BaseDataFeed {
                   this.setPrice(exchange.id, latestTrade.symbol, latestTrade.price, latestTrade.timestamp);
                 }
               } else {
-                this.logger.warn(`No trades found for ${marketId} on ${exchangeName}`);
+                this.logger.warn(`No trades found for ${symbol} on ${exchangeName}`);
               }
             }
           },
@@ -233,7 +235,7 @@ export class CcxtFeed implements BaseDataFeed {
         const error = asError(e);
         if (error instanceof RetryError) {
           this.logger.debug(
-            `Failed to fetch trades after multiple retries for ${exchange.id}/${marketIds}: ${error.cause}, will attempt again in 5 minutes`,
+            `Failed to fetch trades after multiple retries for ${exchange.id}/${marketSymbols}: ${error.cause}, will attempt again in 5 minutes`,
           );
           await sleepFor(300_000); // Wait 5 minutes, we must be rate-limited
         } else throw error;
@@ -241,11 +243,11 @@ export class CcxtFeed implements BaseDataFeed {
     }
   }
 
-  private async watchTradesForSymbols(exchange: Exchange, marketIds: string[]) {
+  private async watchTradesForSymbols(exchange: Exchange, marketSymbols: string[]) {
     const sinceBySymbol = new Map<string, number>();
     while (true) {
       try {
-        const trades = await exchange.watchTradesForSymbols(marketIds);
+        const trades = await exchange.watchTradesForSymbols(marketSymbols);
 
         // Some exchange impls don't respect the "since" filter parameter or guarantee trade ordering, so we retrieve the full trade buffer and filter manually.
         const since = sinceBySymbol.get(trades[0].symbol) ?? 0;
@@ -263,17 +265,17 @@ export class CcxtFeed implements BaseDataFeed {
         this.processVolume(exchange.id, lastTrade.symbol, newTrades);
       } catch (e) {
         const error = asError(e);
-        this.logger.debug(`Failed to watch trades for ${exchange.id}/${marketIds}: ${error}, will retry`);
+        this.logger.debug(`Failed to watch trades for ${exchange.id}/${marketSymbols}: ${error}, will retry`);
         await sleepFor(10_000);
       }
     }
   }
 
-  private async watchTradesForSymbol(exchange: Exchange, marketId: string) {
+  private async watchTradesForSymbol(exchange: Exchange, symbol: string) {
     let since = undefined;
     while (true) {
       try {
-        const trades = await exchange.watchTrades(marketId, since);
+        const trades = await exchange.watchTrades(symbol, since);
         if (trades.length === 0) {
           await sleepFor(1_000);
           continue;
@@ -289,7 +291,7 @@ export class CcxtFeed implements BaseDataFeed {
         this.processVolume(exchange.id, lastTrade.symbol, trades);
       } catch (e) {
         const error = asError(e);
-        this.logger.debug(`Failed to watch trades for ${exchange.id}/${marketId}: ${error}, will retry`);
+        this.logger.debug(`Failed to watch trades for ${exchange.id}/${symbol}: ${error}, will retry`);
         await sleepFor(5_000 + Math.random() * 10_000);
       }
     }
@@ -387,7 +389,7 @@ export class CcxtFeed implements BaseDataFeed {
       if (market == undefined) continue;
       this.logger.log(`Fetching last price for ${market.id} on ${source.exchange}`);
       try {
-        const ticker = await exchange.fetchTicker(market.id);
+        const ticker = await exchange.fetchTicker(market.symbol);
         if (ticker === undefined) {
           this.logger.warn(`Ticker not found for ${market.id} on ${source.exchange}`);
           continue;
