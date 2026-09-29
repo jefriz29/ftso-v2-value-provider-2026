@@ -7,6 +7,7 @@ import { BaseDataFeed } from './data-feeds/base-feed';
 import { FixedFeed } from './data-feeds/fixed-feed';
 import { FtsoFeedV1 } from './data-feeds/ftso-feed-v1';
 import { FtsoFeedWebSocket } from './data-feeds/ftso-feed-websocket';
+import { FtsoFeedCombined } from './data-feeds/ftso-feed-combined';
 
 @Module({
   imports: [],
@@ -29,6 +30,10 @@ import { FtsoFeedWebSocket } from './data-feeds/ftso-feed-websocket';
           const websocketFeed = new FtsoFeedWebSocket();
           await websocketFeed.start();
           dataFeed = websocketFeed;
+        } else if (process.env.VALUE_PROVIDER_IMPL === 'ftso-combined') {
+          const combinedFeed = new FtsoFeedCombined();
+          await combinedFeed.start();
+          dataFeed = combinedFeed;
         } else {
           const ccxtFeed = new CcxtFeed();
           await ccxtFeed.start();
