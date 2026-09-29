@@ -53,6 +53,7 @@ export class FtsoFeedV1 implements BaseDataFeed {
   constructor(
     private readonly ccxtFeed: CcxtFeed = new CcxtFeed(),
     private readonly startCcxtFeed = true,
+    private readonly useCcxtFallback = true,
   ) {}
 
   async start(): Promise<void> {
@@ -75,11 +76,13 @@ export class FtsoFeedV1 implements BaseDataFeed {
         const value = await this.fetchApiPrice(feed, apiConfig);
         return { feed, value };
       } catch (error) {
-        this.logger.warn(`API price unavailable for ${feed.name}; using CCXT: ${asError(error).message}`);
+        this.logger.warn(
+          `API price unavailable for ${feed.name}; ${this.useCcxtFallback ? 'using CCXT' : 'no V1 value'}: ${asError(error).message}`,
+        );
       }
     }
 
-    return this.ccxtFeed.getValue(feed);
+    return this.fallbackValue(feed);
   }
 
   async getValues(feeds: FeedId[]): Promise<FeedValueData[]> {
@@ -110,8 +113,10 @@ export class FtsoFeedV1 implements BaseDataFeed {
             return { feed, value: price };
           }
 
-          this.logger.warn(`Bulk API price unavailable for ${feed.name}; using CCXT`);
-          return this.ccxtFeed.getValue(feed);
+          this.logger.warn(
+            `Bulk API price unavailable for ${feed.name}; ${this.useCcxtFallback ? 'using CCXT' : 'no V1 value'}`,
+          );
+          return this.fallbackValue(feed);
         }
 
         return this.getValue(feed);
@@ -122,6 +127,10 @@ export class FtsoFeedV1 implements BaseDataFeed {
   async getVolumes(feeds: FeedId[], volumeWindow: number): Promise<FeedVolumeData[]> {
     // The custom API supplies prices only. Trade volumes continue to come from CCXT.
     return this.ccxtFeed.getVolumes(feeds, volumeWindow);
+  }
+
+  private fallbackValue(feed: FeedId): Promise<FeedValueData> {
+    return this.useCcxtFallback ? this.ccxtFeed.getValue(feed) : Promise.resolve({ feed, value: undefined });
   }
 
   private async fetchApiPrice(feed: FeedId, config: ApiConfig): Promise<number> {
