@@ -16,6 +16,10 @@ interface ApiConfig {
   pricePath: string;
   /** Optional headers. Values may reference environment variables as ${NAME}. */
   headers?: Record<string, string>;
+  /** HTTP method. Existing feeds default to GET. */
+  method?: string;
+  /** Optional JSON request body, used by POST-based price APIs. */
+  body?: unknown;
   timeoutMs?: number;
 }
 
@@ -125,9 +129,16 @@ export class FtsoFeedV1 implements BaseDataFeed {
     const timeout = setTimeout(() => controller.abort(), config.timeoutMs ?? DEFAULT_API_TIMEOUT_MS);
 
     try {
+      const method = config.method?.toUpperCase() === 'POST' ? 'POST' : 'GET';
+      const headers = this.resolveHeaders(config.headers);
+      if (method === 'POST' && !Object.keys(headers).some((name) => name.toLowerCase() === 'content-type')) {
+        headers['content-type'] = 'application/json';
+      }
+
       const response = await fetch(config.url, {
-        method: 'GET',
-        headers: this.resolveHeaders(config.headers),
+        method,
+        headers,
+        body: method === 'POST' && config.body !== undefined ? JSON.stringify(config.body) : undefined,
         signal: controller.signal,
       });
 
