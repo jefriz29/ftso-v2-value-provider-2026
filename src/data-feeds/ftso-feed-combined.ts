@@ -3,7 +3,7 @@ import { FeedId, FeedValueData, FeedVolumeData } from '../dto/provider-requests.
 import { BaseDataFeed } from './base-feed';
 import { CcxtFeed } from './ccxt-provider-service';
 import { FtsoFeedV1 } from './ftso-feed-v1';
-import { FtsoFeedWebSocket } from './ftso-feed-websocket';
+import { WebSocketPriceService } from './websocket-price-service';
 
 type PriceSource = 'ftso-v1' | 'ftso-websocket' | 'ccxt';
 
@@ -57,43 +57,66 @@ export class FtsoFeedCombined implements BaseDataFeed {
   private readonly logger = new Logger(FtsoFeedCombined.name);
   private readonly ccxt = new CcxtFeed();
   private readonly v1 = new FtsoFeedV1(this.ccxt, false);
-  private readonly websocket = new FtsoFeedWebSocket(this.v1, false);
+  private readonly websocket = new WebSocketPriceService();
 
   async start(): Promise<void> {
     await this.ccxt.start();
     await this.v1.start();
-    await this.websocket.start();
-    this.logger.log('Combined provider initialized; CCXT reference is shared by V1 and WebSocket fallbacks');
+    this.websocket.start();
+    this.logger.log('Combined provider initialized; V1, direct WebSocket and CCXT comparison enabled');
   }
 
   async getValue(feed: FeedId): Promise<FeedValueData> {
-    const [v1Result, websocketResult, ccxtResult] = await Promise.allSettled([
-      this.v1.getValue(feed),
-      this.websocket.getValue(feed),
-      this.ccxt.getValue(feed),
-    ]);
-
-    const v1Price = fulfilledPrice(v1Result);
-    const websocketPrice = fulfilledPrice(websocketResult);
-    const ccxtPrice = fulfilledPrice(ccxtResult);
-    const selected = selectCombinedPrice(v1Price, websocketPrice, ccxtPrice);
-
-    this.logger.log(
-      `Combined price for ${feed.name}: selected=${selected.value ?? 'unavailable'} source=${selected.source} ` +
-        `v1=${v1Price ?? 'unavailable'} websocket=${websocketPrice ?? 'unavailable'} ccxt=${ccxtPrice ?? 'unavailable'} ` +
-        `v1DeviationPct=${formatDeviation(selected.v1DeviationPct)} ` +
-        `websocketDeviationPct=${formatDeviation(selected.websocketDeviationPct)}`,
-    );
-
-    return { feed, value: selected.value };
+    return (await this.getValues([feed]))[0];
   }
 
   async getValues(feeds: FeedId[]): Promise<FeedValueData[]> {
-    return Promise.all(feeds.map((feed) => this.getValue(feed)));
+    // V1 batches all CoinGecko-configured feeds into one request. The direct
+    // WebSocket path deliberately bypasses its V1/CCXT fallback so the three
+    // values remain independent observations instead of duplicated fallbacks.
+    const [v1Result, websocketResult, ccxtResult] = await Promise.allSettled([
+      this.v1.getValues(feeds),
+      Promise.resolve(this.getDirectWebSocketValues(feeds)),
+      this.ccxt.getValues(feeds),
+    ]);
+
+    const v1ByKey = valuesByFeed(v1Result.status === 'fulfilled' ? v1Result.value : []);
+    const websocketByKey = valuesByFeed(websocketResult.status === 'fulfilled' ? websocketResult.value : []);
+    const ccxtByKey = valuesByFeed(ccxtResult.status === 'fulfilled' ? ccxtResult.value : []);
+
+    return feeds.map((feed) => {
+      const key = feedKey(feed);
+      const v1Price = v1ByKey.get(key);
+      const websocketPrice = websocketByKey.get(key);
+      const ccxtPrice = ccxtByKey.get(key);
+      const selected = selectCombinedPrice(v1Price, websocketPrice, ccxtPrice);
+
+      this.logger.log(
+        `Combined price for ${feed.name}: selected=${selected.value ?? 'unavailable'} source=${selected.source} ` +
+          `v1=${v1Price ?? 'unavailable'} websocket=${websocketPrice ?? 'unavailable'} ccxt=${ccxtPrice ?? 'unavailable'} ` +
+          `v1DeviationPct=${formatDeviation(selected.v1DeviationPct)} ` +
+          `websocketDeviationPct=${formatDeviation(selected.websocketDeviationPct)}`,
+      );
+
+      return { feed, value: selected.value };
+    });
   }
 
   async getVolumes(feeds: FeedId[], volumeWindow: number): Promise<FeedVolumeData[]> {
     return this.ccxt.getVolumes(feeds, volumeWindow);
+  }
+
+  private getDirectWebSocketValues(feeds: FeedId[]): FeedValueData[] {
+    return feeds.map((feed) => {
+      const direct = this.websocket.getMedian(feed);
+      if (direct === undefined) return { feed, value: undefined };
+
+      this.logger.debug(
+        `Direct WebSocket price for ${feed.name}: ${direct.value} ` +
+          `sources=${direct.sources.join(',')} newestAgeMs=${direct.newestAgeMs}`,
+      );
+      return { feed, value: direct.value };
+    });
   }
 }
 
@@ -105,8 +128,17 @@ function percentageDeviation(value: number, reference: number): number {
   return (Math.abs(value - reference) / reference) * 100;
 }
 
-function fulfilledPrice(result: PromiseSettledResult<FeedValueData>): number | undefined {
-  return result.status === 'fulfilled' ? validPrice(result.value.value) : undefined;
+function valuesByFeed(values: FeedValueData[]): Map<string, number> {
+  const result = new Map<string, number>();
+  for (const item of values) {
+    const price = validPrice(item.value);
+    if (price !== undefined) result.set(feedKey(item.feed), price);
+  }
+  return result;
+}
+
+function feedKey(feed: FeedId): string {
+  return `${feed.category}:${feed.name}`;
 }
 
 function formatDeviation(value: number | undefined): string {
