@@ -43,9 +43,13 @@ interface CoinGeckoFeed {
  */
 export class FtsoFeedV1 implements BaseDataFeed {
   private readonly logger = new Logger(FtsoFeedV1.name);
-  private readonly ccxtFeed = new CcxtFeed();
   private readonly configByKey = new Map<string, FeedConfig>();
   private coinGeckoCache: { expiresAt: number; prices: Map<string, number> } | undefined;
+
+  constructor(
+    private readonly ccxtFeed: CcxtFeed = new CcxtFeed(),
+    private readonly startCcxtFeed = true,
+  ) {}
 
   async start(): Promise<void> {
     const config = this.loadConfig();
@@ -53,7 +57,7 @@ export class FtsoFeedV1 implements BaseDataFeed {
       this.configByKey.set(this.feedKey(item.feed), item);
     }
 
-    await this.ccxtFeed.start();
+    if (this.startCcxtFeed) await this.ccxtFeed.start();
 
     const apiFeedCount = config.filter((item) => this.isApiEnabled(item.api)).length;
     this.logger.log(`Initialized ${config.length} feeds (${apiFeedCount} API-primary, CCXT fallback enabled)`);
