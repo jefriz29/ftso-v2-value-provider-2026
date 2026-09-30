@@ -5,5 +5,7 @@ export abstract class BaseDataFeed {
 
   abstract getValues(feeds: FeedId[]): Promise<FeedValueData[]>;
 
+  getValuesForRound?(feeds: FeedId[], votingRoundId: number): Promise<FeedValueData[]>;
+
   abstract getVolumes(feeds: FeedId[], volumeWindow: number): Promise<FeedVolumeData[]>;
 }

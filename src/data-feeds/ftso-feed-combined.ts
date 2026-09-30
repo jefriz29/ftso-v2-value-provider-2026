@@ -4,6 +4,7 @@ import { BaseDataFeed } from './base-feed';
 import { CcxtFeed } from './ccxt-provider-service';
 import { FtsoFeedV1 } from './ftso-feed-v1';
 import { WebSocketPriceService } from './websocket-price-service';
+import { calculateMedianPrice, FlareMedianMonitor, PriceObservation } from './flare-median-monitor';
 
 type PriceSource = 'ftso-v1' | 'ftso-websocket' | 'ccxt';
 type FinalPriceSource = PriceSource | 'median' | 'last-good' | 'unavailable';
@@ -135,6 +136,7 @@ export class FtsoFeedCombined implements BaseDataFeed {
   private readonly ccxt = new CcxtFeed();
   private readonly v1 = new FtsoFeedV1(this.ccxt, false, false);
   private readonly websocket = new WebSocketPriceService();
+  private readonly flareMedianMonitor = new FlareMedianMonitor();
   private readonly lastGoodPrices = new Map<string, CachedPrice>();
   private readonly lastGoodPriceMaxAgeMs = positiveIntegerFromEnv('LAST_GOOD_PRICE_MAX_AGE_MS', 30_000);
   private readonly nearCcxtMaxDeviationPct = positiveNumberFromEnv('NEAR_CCXT_MAX_DEVIATION_PCT', 0.2);
@@ -151,6 +153,14 @@ export class FtsoFeedCombined implements BaseDataFeed {
   }
 
   async getValues(feeds: FeedId[]): Promise<FeedValueData[]> {
+    return this.getValuesInternal(feeds);
+  }
+
+  async getValuesForRound(feeds: FeedId[], votingRoundId: number): Promise<FeedValueData[]> {
+    return this.getValuesInternal(feeds, votingRoundId);
+  }
+
+  private async getValuesInternal(feeds: FeedId[], votingRoundId?: number): Promise<FeedValueData[]> {
     // V1 batches all CoinGecko-configured feeds into one request. The direct
     // WebSocket path deliberately bypasses its V1/CCXT fallback so the three
     // values remain independent observations instead of duplicated fallbacks.
@@ -164,13 +174,25 @@ export class FtsoFeedCombined implements BaseDataFeed {
     const websocketByKey = valuesByFeed(websocketResult.status === 'fulfilled' ? websocketResult.value : []);
     const ccxtByKey = valuesByFeed(ccxtResult.status === 'fulfilled' ? ccxtResult.value : []);
 
-    return feeds.map((feed) => {
+    const observations: PriceObservation[] = [];
+    const values = feeds.map((feed) => {
       const key = feedKey(feed);
       const v1Price = v1ByKey.get(key);
       const websocketPrice = websocketByKey.get(key);
       const ccxtPrice = ccxtByKey.get(key);
       const liveSelection = selectCombinedPrice(v1Price, websocketPrice, ccxtPrice, this.nearCcxtMaxDeviationPct);
       const selected = this.useLastGoodPrice(key, liveSelection);
+      const localMedian = calculateMedianPrice([v1Price, websocketPrice, ccxtPrice]);
+
+      observations.push({
+        feed,
+        v1: v1Price,
+        websocket: websocketPrice,
+        ccxt: ccxtPrice,
+        selected: selected.value,
+        selectedSource: selected.source,
+        localMedian,
+      });
 
       this.logger.log(
         `Combined price for ${feed.name}: selected=${selected.value ?? 'unavailable'} source=${selected.source} ` +
@@ -183,6 +205,9 @@ export class FtsoFeedCombined implements BaseDataFeed {
 
       return { feed, value: selected.value };
     });
+
+    if (votingRoundId !== undefined) this.flareMedianMonitor.schedule(votingRoundId, observations);
+    return values;
   }
 
   async getVolumes(feeds: FeedId[], volumeWindow: number): Promise<FeedVolumeData[]> {
