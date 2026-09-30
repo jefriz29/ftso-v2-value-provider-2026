@@ -10,7 +10,10 @@ export class ExampleProviderService {
     return this.dataFeed.getValue(feed);
   }
 
-  async getValues(feeds: FeedId[]): Promise<FeedValueData[]> {
+  async getValues(feeds: FeedId[], votingRoundId?: number): Promise<FeedValueData[]> {
+    if (votingRoundId !== undefined && this.dataFeed.getValuesForRound !== undefined) {
+      return this.dataFeed.getValuesForRound(feeds, votingRoundId);
+    }
     return this.dataFeed.getValues(feeds);
   }
 
