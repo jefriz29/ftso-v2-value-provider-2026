@@ -6,6 +6,9 @@ import { FtsoFeedV1 } from './ftso-feed-v1';
 import { WebSocketPriceService } from './websocket-price-service';
 import { calculateMedianPrice, FlareMedianMonitor, PriceObservation } from './flare-median-monitor';
 
+import prodFeeds from '../config/feeds.json';
+import testFeeds from '../config/test-feeds.json';
+
 type PriceSource = 'ftso-v1' | 'ftso-websocket' | 'ccxt';
 type FinalPriceSource = PriceSource | 'median' | 'last-good' | 'unavailable';
 
@@ -16,6 +19,60 @@ export interface CombinedPriceResult {
   websocketDeviationPct?: number;
   selectedDeviationPct?: number;
   nearCcxt?: boolean;
+}
+
+/** Percent points: +0.1 increases the selected price by 0.1%. */
+export interface FinalPriceConfig {
+  source?: 'ccxt' | 'v1' | 'socket' | 0;
+  adjustedDeviation?: number;
+}
+
+export function validateFinalPriceConfig(config: FinalPriceConfig): void {
+  if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('finalPrice must be an object');
+  if (config.source !== undefined && !['ccxt', 'v1', 'socket', 0].includes(config.source)) {
+    throw new Error('finalPrice.source must be ccxt, v1, socket or 0');
+  }
+  if (
+    config.adjustedDeviation !== undefined &&
+    (typeof config.adjustedDeviation !== 'number' ||
+      !Number.isFinite(config.adjustedDeviation) ||
+      config.adjustedDeviation <= -100)
+  ) {
+    throw new Error('finalPrice.adjustedDeviation must be finite and greater than -100');
+  }
+}
+
+export function selectConfiguredPrice(
+  v1: number | undefined,
+  socket: number | undefined,
+  ccxt: number | undefined,
+  nearLimit = 0.2,
+  config?: FinalPriceConfig,
+): CombinedPriceResult {
+  const automatic = selectCombinedPrice(v1, socket, ccxt, nearLimit);
+  if (config === undefined) return automatic;
+  validateFinalPriceConfig(config);
+  const requested =
+    config.source === 'ccxt' ? ccxt : config.source === 'v1' ? v1 : config.source === 'socket' ? socket : undefined;
+  const requestedValue = validPrice(requested);
+  const selected: CombinedPriceResult =
+    requestedValue === undefined
+      ? automatic
+      : {
+          ...automatic,
+          value: requestedValue,
+          source: config.source === 'v1' ? 'ftso-v1' : config.source === 'socket' ? 'ftso-websocket' : 'ccxt',
+        };
+  // Adjust only live prices. Last-good caching happens afterwards, avoiding repeated adjustment.
+  const value = selected.value === undefined ? undefined : selected.value * (1 + (config.adjustedDeviation ?? 0) / 100);
+  const reference = validPrice(ccxt);
+  const deviation = value === undefined || reference === undefined ? undefined : percentageDeviation(value, reference);
+  return {
+    ...selected,
+    value: validPrice(value),
+    selectedDeviationPct: deviation,
+    nearCcxt: deviation === undefined ? undefined : deviation <= nearLimit,
+  };
 }
 
 export interface CachedPrice {
@@ -137,6 +194,19 @@ export class FtsoFeedCombined implements BaseDataFeed {
   private readonly v1 = new FtsoFeedV1(this.ccxt, false, false);
   private readonly websocket = new WebSocketPriceService();
   private readonly flareMedianMonitor = new FlareMedianMonitor();
+  private readonly finalPriceByFeed = new Map<string, FinalPriceConfig>(
+    (
+      (process.env.NETWORK === 'local-test' ? testFeeds : prodFeeds) as {
+        feed: FeedId;
+        finalPrice?: FinalPriceConfig;
+      }[]
+    )
+      .filter((item) => item.finalPrice !== undefined)
+      .map((item) => {
+        validateFinalPriceConfig(item.finalPrice);
+        return [feedKey(item.feed), item.finalPrice];
+      }),
+  );
   private readonly lastGoodPrices = new Map<string, CachedPrice>();
   private readonly lastGoodPriceMaxAgeMs = positiveIntegerFromEnv('LAST_GOOD_PRICE_MAX_AGE_MS', 30_000);
   private readonly nearCcxtMaxDeviationPct = positiveNumberFromEnv('NEAR_CCXT_MAX_DEVIATION_PCT', 0.2);
@@ -180,7 +250,13 @@ export class FtsoFeedCombined implements BaseDataFeed {
       const v1Price = v1ByKey.get(key);
       const websocketPrice = websocketByKey.get(key);
       const ccxtPrice = ccxtByKey.get(key);
-      const liveSelection = selectCombinedPrice(v1Price, websocketPrice, ccxtPrice, this.nearCcxtMaxDeviationPct);
+      const liveSelection = selectConfiguredPrice(
+        v1Price,
+        websocketPrice,
+        ccxtPrice,
+        this.nearCcxtMaxDeviationPct,
+        this.finalPriceByFeed.get(key),
+      );
       const selected = this.useLastGoodPrice(key, liveSelection);
       const localMedian = calculateMedianPrice([v1Price, websocketPrice, ccxtPrice]);
 
@@ -196,6 +272,7 @@ export class FtsoFeedCombined implements BaseDataFeed {
 
       this.logger.log(
         `Combined price for ${feed.name}: selected=${selected.value ?? 'unavailable'} source=${selected.source} ` +
+          `configuredSource=${this.finalPriceByFeed.get(key)?.source ?? 'default'} adjustedDeviation=${this.finalPriceByFeed.get(key)?.adjustedDeviation ?? 0} ` +
           `v1=${v1Price ?? 'unavailable'} websocket=${websocketPrice ?? 'unavailable'} ccxt=${ccxtPrice ?? 'unavailable'} ` +
           `v1DeviationPct=${formatDeviation(selected.v1DeviationPct)} ` +
           `websocketDeviationPct=${formatDeviation(selected.websocketDeviationPct)} ` +

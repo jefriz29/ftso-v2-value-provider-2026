@@ -4,11 +4,12 @@ import { FeedId } from '../dto/provider-requests.dto';
 import prodFeeds from '../config/feeds.json';
 import testFeeds from '../config/test-feeds.json';
 
-type SupportedExchange = 'binance' | 'coinbase' | 'kraken';
+type SupportedExchange = 'binance' | 'coinbase' | 'kraken' | 'bybit' | 'bitfinex';
 
 interface FeedConfig {
   feed: FeedId;
   sources: { exchange: string; symbol: string }[];
+  websocketSources?: { exchange: string; symbol: string }[];
 }
 
 interface SourceMapping {
@@ -37,8 +38,10 @@ export interface WebSocketMedian {
   newestAgeMs: number;
 }
 
-const EXCHANGES: SupportedExchange[] = ['binance', 'coinbase', 'kraken'];
+const EXCHANGES: SupportedExchange[] = ['binance', 'coinbase', 'kraken', 'bybit', 'bitfinex'];
 const ENDPOINTS: Record<SupportedExchange, string> = {
+  bybit: 'wss://stream.bybit.com/v5/public/spot',
+  bitfinex: 'wss://api-pub.bitfinex.com/ws/2',
   binance: 'wss://stream.binance.com:9443/ws',
   coinbase: 'wss://ws-feed.exchange.coinbase.com',
   kraken: 'wss://ws.kraken.com/v2',
@@ -58,6 +61,7 @@ export class WebSocketPriceService {
   private readonly mappingsByFeed = new Map<string, SourceMapping[]>();
   private readonly samples = new Map<string, PriceSample>();
   private readonly connections = new Map<SupportedExchange, ConnectionState>();
+  private readonly bitfinexChannels = new Map<number, string>();
   private watchdog?: ReturnType<typeof setInterval>;
 
   start(): void {
@@ -70,7 +74,7 @@ export class WebSocketPriceService {
       this.connect(exchange);
     }
 
-    this.watchdog = setInterval(() => this.checkConnections(), 30_000);
+    this.watchdog = setInterval(() => this.checkConnections(), 20_000);
     this.watchdog.unref?.();
     this.logger.log(
       `Initialized ${this.mappings.length} direct WebSocket sources ` +
@@ -117,7 +121,8 @@ export class WebSocketPriceService {
   private loadMappings(): void {
     const config = (process.env.NETWORK === 'local-test' ? testFeeds : prodFeeds) as FeedConfig[];
     for (const item of config) {
-      for (const source of item.sources ?? []) {
+      for (const source of item.websocketSources ??
+        (item.sources ?? []).filter((source) => ['binance', 'coinbase', 'kraken'].includes(source.exchange))) {
         if (!isSupportedExchange(source.exchange)) continue;
         const feedKey = this.feedKey(item.feed);
         const existingExchangeSource = (this.mappingsByFeed.get(feedKey) ?? []).some(
@@ -150,6 +155,8 @@ export class WebSocketPriceService {
     this.logger.log(`Connecting to ${exchange} public WebSocket`);
     const socket = new WebSocket(ENDPOINTS[exchange]);
     state.socket = socket;
+    for (const mapping of this.mappingsByExchange.get(exchange) ?? []) this.samples.delete(mapping.sourceKey);
+    if (exchange === 'bitfinex') this.bitfinexChannels.clear();
 
     socket.onopen = () => {
       state.attempts = 0;
@@ -157,6 +164,7 @@ export class WebSocketPriceService {
       this.subscribe(exchange, socket);
     };
     socket.onmessage = (event) => {
+      if (state.socket !== socket) return;
       state.lastMessageAt = Date.now();
       try {
         this.handleMessage(exchange, String(event.data));
@@ -174,7 +182,11 @@ export class WebSocketPriceService {
 
   private subscribe(exchange: SupportedExchange, socket: WebSocket): void {
     const symbols = [...new Set((this.mappingsByExchange.get(exchange) ?? []).map((item) => item.nativeSymbol))];
-    if (exchange === 'binance') {
+    if (exchange === 'bybit') {
+      for (const symbol of symbols) socket.send(JSON.stringify({ op: 'subscribe', args: [`tickers.${symbol}`] }));
+    } else if (exchange === 'bitfinex') {
+      for (const symbol of symbols) socket.send(JSON.stringify({ event: 'subscribe', channel: 'ticker', symbol }));
+    } else if (exchange === 'binance') {
       socket.send(
         JSON.stringify({ method: 'SUBSCRIBE', params: symbols.map((symbol) => `${symbol}@bookTicker`), id: 1 }),
       );
@@ -194,6 +206,26 @@ export class WebSocketPriceService {
 
   private handleMessage(exchange: SupportedExchange, raw: string): void {
     const message = JSON.parse(raw) as Record<string, unknown>;
+    if (exchange === 'bybit') {
+      if (message.success === false) this.logger.warn(`Bybit subscription error: ${formatUnknown(message.ret_msg)}`);
+      if (typeof message.topic !== 'string' || !message.topic.startsWith('tickers.')) return;
+      const data = message.data as Record<string, unknown> | undefined;
+      if (data) this.storeMidpoint(exchange, message.topic.slice(8), undefined, undefined, data.lastPrice);
+      return;
+    }
+    if (exchange === 'bitfinex') {
+      if (Array.isArray(message)) {
+        const symbol = this.bitfinexChannels.get(Number(message[0]));
+        const data: unknown = message[1];
+        // Heartbeats keep the connection alive but must not refresh a stale price.
+        if (Array.isArray(data)) this.storeMidpoint(exchange, symbol, data[0], data[2], data[6]);
+      } else if (message.event === 'subscribed' && message.channel === 'ticker' && typeof message.symbol === 'string') {
+        this.bitfinexChannels.set(Number(message.chanId), message.symbol);
+      } else if (message.event === 'error') {
+        this.logger.warn(`Bitfinex subscription error: ${formatUnknown(message.msg)}`);
+      }
+      return;
+    }
     if (exchange === 'binance') {
       const symbol = typeof message.s === 'string' ? message.s.toLowerCase() : undefined;
       this.storeMidpoint(exchange, symbol, message.b, message.a);
@@ -263,6 +295,8 @@ export class WebSocketPriceService {
   private checkConnections(): void {
     const now = Date.now();
     for (const [exchange, state] of this.connections) {
+      if (exchange === 'bybit' && state.socket?.readyState === WebSocket.OPEN)
+        state.socket.send(JSON.stringify({ op: 'ping' }));
       if (state.socket?.readyState === WebSocket.OPEN && now - state.lastMessageAt > 60_000) {
         this.logger.warn(`${exchange} WebSocket silent for 60s; reconnecting`);
         state.socket.close();
@@ -271,6 +305,11 @@ export class WebSocketPriceService {
   }
 
   private toNativeSymbol(exchange: SupportedExchange, symbol: string): string {
+    if (exchange === 'bybit') return symbol.replace('/', '').toUpperCase();
+    if (exchange === 'bitfinex') {
+      if (symbol !== 'LEO/USD') throw new Error('Bitfinex socket mapping currently supports LEO/USD only');
+      return 'tLEOUSD';
+    }
     if (exchange === 'binance') return symbol.replace('/', '').toLowerCase();
     if (exchange === 'coinbase') return symbol.replace('/', '-').toUpperCase();
     return symbol.toUpperCase();

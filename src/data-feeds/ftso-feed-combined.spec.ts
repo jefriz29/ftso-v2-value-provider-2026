@@ -82,3 +82,52 @@ describe('resolveWithLastGoodPrice', () => {
     expect(cache.size).toBe(0);
   });
 });
+
+import { selectConfiguredPrice } from './ftso-feed-combined';
+
+describe('per-feed final price', () => {
+  it.each([
+    ['ccxt', 100],
+    ['v1', 101],
+    ['socket', 102],
+  ] as const)('uses requested %s source even when another is closer', (source, value) => {
+    expect(selectConfiguredPrice(101, 102, 100, 0.2, { source }).value).toBe(value);
+  });
+  it('falls back from zero selected source to custom price nearest CCXT', () => {
+    expect(selectConfiguredPrice(0, 102, 100, 0.2, { source: 'v1' })).toMatchObject({
+      value: 102,
+      source: 'ftso-websocket',
+    });
+  });
+  it('falls back to CCXT when custom sources are zero', () => {
+    expect(selectConfiguredPrice(0, 0, 100, 0.2, { source: 'socket' }).value).toBe(100);
+  });
+  it('keeps the old behavior without settings', () => {
+    expect(selectConfiguredPrice(101, 102, 100)).toEqual(selectCombinedPrice(101, 102, 100));
+  });
+  it.each([0.1, -0.1, 0])('applies signed percent adjustment %s once', (adjustedDeviation) => {
+    expect(selectConfiguredPrice(0, 0, 100, 0.2, { source: 'ccxt', adjustedDeviation }).value).toBeCloseTo(
+      100 + adjustedDeviation,
+    );
+  });
+  it('does not create a price when all sources are missing', () => {
+    expect(selectConfiguredPrice(0, 0, 0, 0.2, { adjustedDeviation: 1 }).value).toBeUndefined();
+  });
+  it.each([-100, NaN, Infinity])('rejects invalid adjustment %s', (adjustedDeviation) => {
+    expect(() => selectConfiguredPrice(1, 1, 1, 0.2, { adjustedDeviation })).toThrow();
+  });
+});
+
+describe('independent optional finalPrice settings', () => {
+  it('adjusts default selection when only adjustedDeviation is set', () => {
+    expect(selectConfiguredPrice(101, 105, 100, 0.2, { adjustedDeviation: 1 })).toMatchObject({
+      value: 102.01,
+      source: 'ftso-v1',
+    });
+  });
+  it('leaves default selection unchanged with empty settings or zero adjustment', () => {
+    for (const config of [{}, { adjustedDeviation: 0 }]) {
+      expect(selectConfiguredPrice(101, 105, 100, 0.2, config)).toMatchObject({ value: 101, source: 'ftso-v1' });
+    }
+  });
+});
